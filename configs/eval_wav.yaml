@@ -1,0 +1,29 @@
+# eval_wav.yaml - 500ms片段直接评估模式
+
+# 数据路径
+data:
+  positive_dir: data/test_detection_results/audio  # 500ms候选片段
+  negative_dir: data/noise_test_segs              # 500ms噪音片段
+
+# 不需要滑动窗口(片段已经是500ms)
+windowing:
+  enabled: false
+
+# 推理设置
+inference:
+  batch_size: 32
+  device: cpu
+  sample_rate: 44100
+
+# 判定阈值
+thresholds:
+  confidence_threshold: 0.5  # 二分类置信度阈值
+
+# 输出设置
+output:
+  save_predictions: true              # 保存预测结果CSV
+  save_misclassified_files: true      # 保存误分类文件列表
+  save_confusion_matrix: true         # 保存混淆矩阵图
+  save_roc_curve: true                # 保存ROC曲线
+  save_pr_curve: true                 # 保存PR曲线
+  generate_detailed_report: true      # 生成详细报告
