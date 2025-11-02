@@ -122,6 +122,11 @@ def setup_argparse():
     dataset_parser.add_argument('--save-wav', action='store_true',
                                help='Save mixed samples as wav files for inspection')
     dataset_parser.add_argument('--verbose', '-v', action='store_true')
+    dataset_parser.add_argument('--noise-manifest', type=str, required=True,  # NEW
+                           help='Noise manifest CSV path')
+    dataset_parser.add_argument('--split', type=str, default='train',  # NEW
+                            choices=['train', 'val', 'test'],
+                            help='Which split to use (default: train)')
     
     # Train command
     train_parser = subparsers.add_parser('train', help='Train CNN model')
@@ -416,360 +421,438 @@ def cmd_trains(args):
 
 
 def cmd_build_dataset(args):
-    """Execute build-dataset command（修正版 - 分离训练/验证集生成）."""
+    """
+    构建训练数据集 (方案2 - 文件级独立 + 70/30策略)
+    
+    工作流程：
+    1. 加载500ms click片段（已包含真实上下文）
+    2. 从noise manifest中按split选取噪音half片段
+    3. 70%同源 + 30%跨域策略叠加click与noise -> 正样本
+    4. 使用相同noise池生成纯噪声负样本（不与正样本重复片段）
+    5. 平衡并保存训练集/验证集
+    """
+    import pandas as pd
+    import numpy as np
+    import soundfile as sf
+    import random
+    import shutil
+    from tqdm import tqdm
+    from pathlib import Path
+    
     logger = ProjectLogger()
     config = load_config(args.config)
     
     logger.info("=" * 60)
-    logger.info("构建训练数据集（click train序列 + SNR混合）")
+    logger.info("构建训练数据集（方案2: 文件级独立 + 70/30策略）")
     logger.info("=" * 60)
-
-    # ========== 清理上次输出 ==========
+    
+    # ========== 初始化目录 ==========
     output_dir = Path(args.output_dir)
     if output_dir.exists():
         logger.info(f"清理上次输出: {output_dir}")
-        train_dir = output_dir / 'train'
-        if train_dir.exists():
-            shutil.rmtree(train_dir)
-        val_dir = output_dir / 'val'
-        if val_dir.exists():
-            shutil.rmtree(val_dir)
-        debug_dir = output_dir / 'debug_wavs'
-        if debug_dir.exists():
-            shutil.rmtree(debug_dir)
-            
+        shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # ========== 初始化配置 ==========
     dataset_config = config['dataset']
     sample_rate = config.get('sample_rate', 44100)
-    window_ms = dataset_config.get('window_ms', 120.0)
+    expected_length_ms = 500.0
+    expected_samples = int(expected_length_ms * sample_rate / 1000)
     
     logger.info(f"样本率: {sample_rate} Hz")
-    logger.info(f"统一样本长度: 500ms ({int(0.5 * sample_rate)} 样本)")
+    logger.info(f"样本长度: {expected_length_ms}ms ({expected_samples} samples)")
     
-    builder = DatasetBuilder(
-        sample_rate=sample_rate,
-        window_ms=window_ms,
-        random_offset_ms=dataset_config['random_offset_ms'],
-        unified_length_ms=500.0
-    )
-    
-    # 初始化增强器
-    augmentation_config = config.get('augmentation', {})
-    augmenter = AugmentationPipeline(
-        sample_rate=sample_rate,
-        snr_range=tuple(augmentation_config.get('snr_range', [-5, 15])),
-        time_shift_ms=augmentation_config.get('time_shift_ms', 10.0),
-        amplitude_range=tuple(augmentation_config.get('amplitude_range', [0.8, 1.25])),
-        apply_prob=augmentation_config.get('apply_prob', 0.8)
-    )
-    
-    logger.info(f"\n增强设置:")
-    logger.info(f"  SNR范围: {augmenter.snr_range} dB")
-    logger.info(f"  时间偏移: ±{augmentation_config.get('time_shift_ms', 10.0)} ms")
-    logger.info(f"  应用概率: {augmenter.apply_prob}")
-    
+    # ========== 1. 加载500ms click片段 ==========
     events_dir = Path(args.events_dir)
-    noise_dir = Path(args.noise_dir)
+    click_files = list(events_dir.rglob('*.wav'))
     
-    # ========== 加载噪声池 ==========
-    logger.info(f"\n加载噪声文件池...")
-    noise_files = list(noise_dir.rglob('*.wav'))
-    
-    if not noise_files:
-        logger.error(f"未找到噪声文件: {noise_dir}")
+    if not click_files:
+        logger.error(f"未找到click文件: {events_dir}")
         return
     
-    logger.info(f"找到 {len(noise_files)} 个噪声文件")
+    logger.info(f"\n加载click片段...")
+    logger.info(f"  源目录: {events_dir}")
+    logger.info(f"  找到文件: {len(click_files)} 个")
     
-    # 加载噪声池（最多100个文件）
-    max_noise_files = min(len(noise_files), 100)
-    noise_pool = []
-    selected_noise_files = random.sample(noise_files, max_noise_files)
-    min_noise_length = int(0.5 * sample_rate)  # 500ms
+    positive_samples = []
+    skipped_clicks = 0
     
-    for noise_file in tqdm(selected_noise_files, desc="加载噪声池"):
+    for click_file in tqdm(click_files, desc="加载click"):
         try:
-            noise_audio, sr = sf.read(noise_file)
+            audio, sr = sf.read(click_file)
             
             # 重采样
             if sr != sample_rate:
                 import librosa
-                noise_audio = librosa.resample(noise_audio, orig_sr=sr, target_sr=sample_rate)
+                audio = librosa.resample(audio, orig_sr=sr, target_sr=sample_rate)
             
             # 转单声道
-            if noise_audio.ndim == 2:
-                noise_audio = noise_audio.mean(axis=1)
+            if audio.ndim == 2:
+                audio = audio.mean(axis=1)
             
-            # 🔧 确保噪声足够长（如果短于500ms，重复填充）
-            if len(noise_audio) < min_noise_length:
-                repeats = int(np.ceil(min_noise_length / len(noise_audio)))
-                noise_audio = np.tile(noise_audio, repeats)
-                logger.debug(f"噪声文件 {noise_file.name} 过短，已重复填充")
+            # 验证长度
+            if len(audio) != expected_samples:
+                logger.debug(f"长度不符: {click_file.name} ({len(audio)} vs {expected_samples})")
+                skipped_clicks += 1
+                continue
             
-            # RMS归一化到固定水平
-            rms = np.sqrt(np.mean(noise_audio**2))
-            if rms > 1e-8:
-                target_rms = 0.1
-                noise_audio = noise_audio * (target_rms / rms)
-            
-            # 峰值裁剪
-            peak = np.max(np.abs(noise_audio))
-            if peak > 0.95:
-                noise_audio = noise_audio / peak * 0.95
-            
-            noise_pool.append(noise_audio)
+            positive_samples.append({
+                'waveform': audio.astype(np.float32),
+                'label': 1,
+                'file_id': click_file.stem
+            })
             
         except Exception as e:
-            logger.error(f"加载噪声失败 {noise_file}: {e}")
+            logger.error(f"加载失败 {click_file}: {e}")
+            skipped_clicks += 1
             continue
-
-    logger.info(f"成功加载 {len(noise_pool)} 个噪声片段（已RMS归一化到0.1）")
     
-    if len(noise_pool) == 0:
-        logger.error("噪声池为空！")
+    logger.info(f"  成功加载: {len(positive_samples)} 个")
+    if skipped_clicks > 0:
+        logger.warning(f"  跳过: {skipped_clicks} 个")
+    
+    if len(positive_samples) == 0:
+        logger.error("❌ 没有有效的click样本！")
         return
     
-    # ========== 准备Click素材文件 ==========
-    logger.info(f"\n准备Click素材文件...")
-    positive_files = list(events_dir.rglob('*.wav'))
-
-    if not positive_files:
-        logger.error(f"未找到click文件: {events_dir}")
+    # ========== 2. 加载noise manifest ==========
+    manifest_path = Path(args.noise_manifest)
+    if not manifest_path.exists():
+        logger.error(f"未找到noise manifest: {manifest_path}")
         return
-
-    logger.info(f"找到 {len(positive_files)} 个click片段用于组建train")
-
-    # ========== 生成Click Train序列样本 ==========
-    train_config = dataset_config.get('click_train', {})
-    enable_train = train_config.get('enable', True)
-
-    if not enable_train:
-        logger.error("❌ 必须启用click train生成！")
+    
+    logger.info(f"\n加载noise manifest...")
+    logger.info(f"  Manifest路径: {manifest_path}")
+    
+    df = pd.read_csv(manifest_path)
+    split = args.split.lower()
+    df_split = df[df["split"] == split].reset_index(drop=True)
+    
+    if len(df_split) == 0:
+        logger.error(f"❌ Manifest中没有split='{split}'的数据！")
         return
-
-    logger.info(f"\n生成Click Train序列样本...")
-
-    # 🔧 新增：读取训练集和验证集样本数
-    n_train_samples = train_config.get('n_samples', 8000)
-    n_val_samples = train_config.get('val_samples', 2000)
-    train_length_ms = train_config.get('train_length_ms', 500.0)
-    min_clicks = train_config.get('min_clicks', 2)
-    max_clicks = train_config.get('max_clicks', 5)
-    ici_range_ms = tuple(train_config.get('ici_range_ms', [10.0, 80.0]))
-
-    logger.info(f"  训练集样本数: {n_train_samples}")
-    logger.info(f"  验证集样本数: {n_val_samples}")
-    logger.info(f"  Train长度: {train_length_ms}ms")
-    logger.info(f"  Clicks数范围: {min_clicks}-{max_clicks}")
-    logger.info(f"  ICI范围: {ici_range_ms} ms")
-
-    # 🔧 分别生成训练集和验证集
-    logger.info(f"\n生成训练集 click trains...")
-    train_samples = builder.build_click_train_samples(
-        click_files=positive_files,
-        n_train_samples=n_train_samples,
-        train_length_ms=train_length_ms,
-        min_clicks=min_clicks,
-        max_clicks=max_clicks,
-        ici_range_ms=ici_range_ms,
-        sample_rate=sample_rate,
-        noise_pool=noise_pool,
-        augmenter=augmenter
-    )
-
-    logger.info(f"\n生成验证集 click trains...")
-    val_positive_samples = builder.build_click_train_samples(
-        click_files=positive_files,
-        n_train_samples=n_val_samples,
-        train_length_ms=train_length_ms,
-        min_clicks=min_clicks,
-        max_clicks=max_clicks,
-        ici_range_ms=ici_range_ms,
-        sample_rate=sample_rate,
-        noise_pool=noise_pool,
-        augmenter=augmenter
-    )
-
-    logger.info(f"  训练集正样本: {len(train_samples)}")
-    logger.info(f"  验证集正样本: {len(val_positive_samples)}")
     
-    # ========== 处理负样本 ==========
-    logger.info(f"\n处理负样本...")
+    logger.info(f"  Split: {split}")
+    logger.info(f"  可用half片段: {len(df_split)} 个")
     
+    # 识别parent_id（噪音源）
+    parent_ids = df_split['parent_id'].unique()
+    logger.info(f"  包含噪音源: {sorted(parent_ids)} (共{len(parent_ids)}个)")
+    
+    # 统计每个parent_id的片段数
+    for pid in sorted(parent_ids):
+        count = len(df_split[df_split['parent_id'] == pid])
+        logger.info(f"    Parent {pid}: {count} half-segments")
+    
+    # ========== 3. 预检查容量 ==========
     balance_ratio = dataset_config.get('balance_ratio', 1.0)
+    n_positives = len(positive_samples)
+    n_negatives = int(n_positives * balance_ratio)
+    total_needed = n_positives + n_negatives
     
-    # 训练集负样本
-    n_negative_train = int(len(train_samples) * balance_ratio)
-    n_negative_per_file_train = max(1, n_negative_train // len(noise_files))
+    logger.info(f"\n容量检查...")
+    logger.info(f"  需要正样本: {n_positives}")
+    logger.info(f"  需要负样本: {n_negatives} (balance_ratio={balance_ratio})")
+    logger.info(f"  总需求: {total_needed} half-segments")
+    logger.info(f"  可用容量: {len(df_split)} half-segments")
     
-    # 验证集负样本
-    n_negative_val = int(len(val_positive_samples) * balance_ratio)
-    n_negative_per_file_val = max(1, n_negative_val // len(noise_files))
+    if total_needed > len(df_split):
+        logger.warning(f"⚠️  容量不足！需要 {total_needed}，只有 {len(df_split)}")
+        logger.warning(f"    将允许噪音片段重复使用")
+        allow_reuse = True
+    else:
+        logger.info(f"✅ 容量充足 ({len(df_split) - total_needed} 片段剩余)")
+        allow_reuse = False
     
-    logger.info(f"训练集目标负样本数: {n_negative_train}")
-    logger.info(f"验证集目标负样本数: {n_negative_val}")
+    # 用于记录已使用的噪音片段
+    used_idx = set()
     
-    train_negative_samples = []
-    val_negative_samples = []
+    # ========== 4. 定义辅助函数 ==========
     
-    # 🔧 使用不同的随机种子确保训练集和验证集的负样本不重叠
-    train_noise_files = noise_files[:int(len(noise_files) * 0.8)]  # 80%用于训练
-    val_noise_files = noise_files[int(len(noise_files) * 0.8):]    # 20%用于验证
+    def get_noise_half(force_parent_id=None):
+        """
+        随机选一个未使用的噪声half（支持指定parent_id）
+        
+        Args:
+            force_parent_id: 如果指定，只从该parent_id中采样
+            
+        Returns:
+            (noise_segment, row_info)
+        """
+        # 确定采样池
+        if force_parent_id is not None:
+            df_pool = df_split[df_split['parent_id'] == force_parent_id].reset_index(drop=True)
+            pool_name = f"parent_{force_parent_id}"
+        else:
+            df_pool = df_split
+            pool_name = "all"
+        
+        if len(df_pool) == 0:
+            raise ValueError(f"No segments available for {pool_name}")
+        
+        # 检查是否用尽
+        if not allow_reuse and len(used_idx) >= len(df_split):
+            raise RuntimeError(f"Noise pool exhausted: {len(used_idx)}/{len(df_split)}")
+        
+        # 采样
+        max_attempts = 100
+        for attempt in range(max_attempts):
+            idx = random.randrange(len(df_pool))
+            row = df_pool.iloc[idx]
+            
+            # 构造全局索引（用于去重）
+            global_idx = f"{row.parent_id}_{row.original_seg_id}_{row.half}"
+            
+            if allow_reuse or global_idx not in used_idx:
+                used_idx.add(global_idx)
+                
+                # 读取音频
+                y, sr = sf.read(row.path)
+                seg = y[int(row.start):int(row.end)]
+                
+                # 验证长度
+                if len(seg) == expected_samples:
+                    return seg.astype(np.float32), row
+        
+        # 如果多次尝试失败
+        raise RuntimeError(f"Failed to get valid noise segment after {max_attempts} attempts")
     
-    logger.info(f"训练集使用 {len(train_noise_files)} 个噪声文件")
-    logger.info(f"验证集使用 {len(val_noise_files)} 个噪声文件")
+    def mix_with_snr(click, noise, snr_db):
+        """
+        按指定SNR混合click与noise
+        
+        Args:
+            click: Click信号
+            noise: 噪音信号
+            snr_db: 目标SNR (dB)
+            
+        Returns:
+            混合后的信号
+        """
+        # 计算RMS功率
+        rms_click = np.sqrt(np.mean(click**2))
+        rms_noise = np.sqrt(np.mean(noise**2))
+        
+        # SNR = 20*log10(RMS_signal / RMS_noise)
+        snr_linear = 10 ** (snr_db / 20)
+        
+        # 缩放噪音
+        if rms_noise > 1e-10:
+            scaled_noise = noise * (rms_click / (snr_linear * rms_noise))
+        else:
+            scaled_noise = noise
+        
+        # 混合
+        mixed = click + scaled_noise
+        
+        # 防止削波
+        return np.clip(mixed, -1.0, 1.0)
     
-    # 生成训练集负样本（添加RMS归一化）
-    for noise_file in tqdm(train_noise_files, desc="生成训练集负样本"):
+    # ========== 5. 生成正样本（70%同源 + 30%跨域） ==========
+    snr_range = dataset_config.get('snr_range', [-5, 15])
+    snr_min, snr_max = snr_range
+    
+    logger.info(f"\n生成正样本...")
+    logger.info(f"  策略: 70%同源 + 30%跨域")
+    logger.info(f"  SNR范围: [{snr_min}, {snr_max}] dB")
+    
+    # 检查是否有多个噪音源（用于跨域）
+    has_multiple_sources = len(parent_ids) > 1
+    
+    if not has_multiple_sources:
+        logger.warning(f"⚠️  只有1个噪音源，无法实现跨域策略")
+        logger.warning(f"    将100%使用同源噪音")
+    
+    mixed_positive = []
+    strategy_counts = {'same_domain': 0, 'cross_domain': 0, 'fallback': 0}
+    
+    for i, sample in enumerate(tqdm(positive_samples, desc="混合click+noise")):
         try:
-            audio, sr = sf.read(noise_file)
+            # 决定策略：70%同源 or 30%跨域
+            use_cross_domain = (random.random() >= 0.7) and has_multiple_sources
             
-            if sr != sample_rate:
-                import librosa
-                audio = librosa.resample(audio, orig_sr=sr, target_sr=sample_rate)
+            if use_cross_domain:
+                # 跨域策略：随机选择一个parent_id
+                selected_parent = random.choice(list(parent_ids))
+                noise_seg, row = get_noise_half(force_parent_id=selected_parent)
+                strategy = 'cross_domain'
+                strategy_counts['cross_domain'] += 1
+            else:
+                # 同源策略：从所有噪音中随机选
+                noise_seg, row = get_noise_half()
+                strategy = 'same_domain'
+                strategy_counts['same_domain'] += 1
             
-            if audio.ndim == 2:
-                audio = audio.mean(axis=1)
+            # 随机SNR
+            snr_db = random.uniform(snr_min, snr_max)
             
-            # 🔧 关键修复：添加RMS归一化（与噪音池加载保持一致）
-            rms = np.sqrt(np.mean(audio**2))
-            if rms > 1e-8:
-                target_rms = 0.1
-                audio = audio * (target_rms / rms)
+            # 混合
+            mixed = mix_with_snr(sample['waveform'], noise_seg, snr_db)
             
-            # 峰值裁剪
-            peak = np.max(np.abs(audio))
-            if peak > 0.95:
-                audio = audio / peak * 0.95
-            
-            file_id = noise_file.stem
-            negative_samples = builder.build_negative_samples(
-                audio, file_id, n_negative_per_file_train
-            )
-            train_negative_samples.extend(negative_samples)
+            mixed_positive.append({
+                'waveform': mixed,
+                'label': 1,
+                'file_id': f"{sample['file_id']}_noise{row.parent_id}_{row.segment_id}_snr{snr_db:.1f}",
+                'strategy': strategy,
+                'snr_db': snr_db,
+                'noise_parent': int(row.parent_id)
+            })
             
         except Exception as e:
-            logger.error(f"处理 {noise_file} 时出错: {e}")
+            logger.error(f"生成正样本 {i} 失败: {e}")
             continue
     
-    # 生成验证集负样本
-    for noise_file in tqdm(val_noise_files, desc="生成验证集负样本"):
+    # 统计策略分布
+    total_mixed = len(mixed_positive)
+    logger.info(f"\n  成功生成: {total_mixed} 个正样本")
+    logger.info(f"  策略分布:")
+    for strategy, count in strategy_counts.items():
+        if count > 0:
+            percentage = count / total_mixed * 100
+            logger.info(f"    {strategy}: {count} ({percentage:.1f}%)")
+    
+    if total_mixed == 0:
+        logger.error("❌ 没有成功生成正样本！")
+        return
+    
+    # ========== 6. 生成负样本（纯noise，不与正样本重复） ==========
+    logger.info(f"\n生成负样本...")
+    logger.info(f"  目标数量: {n_negatives}")
+    logger.info(f"  策略: 从同一noise池采样，不与正样本重复片段")
+    
+    negative_samples = []
+    
+    for i in tqdm(range(n_negatives), desc="采样负样本"):
         try:
-            audio, sr = sf.read(noise_file)
+            noise_seg, row = get_noise_half()
             
-            if sr != sample_rate:
-                import librosa
-                audio = librosa.resample(audio, orig_sr=sr, target_sr=sample_rate)
-            
-            if audio.ndim == 2:
-                audio = audio.mean(axis=1)
-            
-            # 🔧 关键修复：添加RMS归一化
-            rms = np.sqrt(np.mean(audio**2))
-            if rms > 1e-8:
-                target_rms = 0.1
-                audio = audio * (target_rms / rms)
-            
-            # 峰值裁剪
-            peak = np.max(np.abs(audio))
-            if peak > 0.95:
-                audio = audio / peak * 0.95
-            
-            file_id = noise_file.stem
-            negative_samples = builder.build_negative_samples(
-                audio, file_id, n_negative_per_file_val
-            )
-            val_negative_samples.extend(negative_samples)
+            negative_samples.append({
+                'waveform': noise_seg,
+                'label': 0,
+                'file_id': f"neg_{row.parent_id}_{row.segment_id}",
+                'noise_parent': int(row.parent_id)
+            })
             
         except Exception as e:
-            logger.error(f"处理 {noise_file} 时出错: {e}")
+            logger.error(f"生成负样本 {i} 失败: {e}")
             continue
     
-    logger.info(f"训练集负样本: {len(train_negative_samples)}")
-    logger.info(f"验证集负样本: {len(val_negative_samples)}")
+    logger.info(f"  成功生成: {len(negative_samples)} 个负样本")
     
-    # ========== 合并和平衡 ==========
-    logger.info(f"\n平衡数据集...")
+    if len(negative_samples) == 0:
+        logger.error("❌ 没有成功生成负样本！")
+        return
     
-    # 训练集
-    all_train_samples = train_samples + train_negative_samples
-    balanced_train = builder.balance_dataset(all_train_samples, balance_ratio=balance_ratio)
+    # ========== 7. 合并并划分训练/验证集 ==========
+    logger.info(f"\n划分训练/验证集...")
     
-    # 验证集
-    all_val_samples = val_positive_samples + val_negative_samples
-    balanced_val = builder.balance_dataset(all_val_samples, balance_ratio=balance_ratio)
+    all_samples = mixed_positive + negative_samples
+    random.shuffle(all_samples)
     
-    logger.info(f"平衡后训练集: {len(balanced_train)}")
-    logger.info(f"平衡后验证集: {len(balanced_val)}")
+    val_split = dataset_config.get('val_split', 0.2)
+    split_idx = int(len(all_samples) * (1 - val_split))
+    train_samples = all_samples[:split_idx]
+    val_samples = all_samples[split_idx:]
+    
+    # 统计
+    train_pos = sum(1 for s in train_samples if s['label'] == 1)
+    train_neg = len(train_samples) - train_pos
+    val_pos = sum(1 for s in val_samples if s['label'] == 1)
+    val_neg = len(val_samples) - val_pos
+    
+    logger.info(f"  训练集: {len(train_samples)} (正:{train_pos}, 负:{train_neg})")
+    logger.info(f"  验证集: {len(val_samples)} (正:{val_pos}, 负:{val_neg})")
     
     # 验证样本形状
-    unique_lengths = set(len(s['waveform']) for s in balanced_train + balanced_val)
+    unique_lengths = set(len(s['waveform']) for s in all_samples)
     if len(unique_lengths) > 1:
         logger.error(f"⚠️ 样本长度不一致: {unique_lengths}")
         return
     else:
-        logger.info(f"✅ 所有样本长度统一: {list(unique_lengths)[0]} 样本")
+        logger.info(f"✅ 所有样本长度统一: {list(unique_lengths)[0]} samples")
     
-    # 统计
-    n_train_pos = sum(1 for s in balanced_train if s['label'] == 1)
-    n_train_neg = len(balanced_train) - n_train_pos
-    n_val_pos = sum(1 for s in balanced_val if s['label'] == 1)
-    n_val_neg = len(balanced_val) - n_val_pos
+    # ========== 8. 保存数据集 ==========
+    logger.info(f"\n保存数据集到: {output_dir}")
     
-    logger.info(f"\n最终组成:")
-    logger.info(f"  训练集 - 正样本: {n_train_pos}, 负样本: {n_train_neg}")
-    logger.info(f"  验证集 - 正样本: {n_val_pos}, 负样本: {n_val_neg}")
+    # 导入DatasetBuilder
+    from training.dataset.segments import DatasetBuilder
     
-    # ========== 保存 ==========
-    logger.info(f"\n保存到 {output_dir}")
+    builder = DatasetBuilder(
+        sample_rate=sample_rate,
+        window_ms=120.0,
+        random_offset_ms=0,
+        unified_length_ms=expected_length_ms
+    )
     
-    builder.save_dataset(balanced_train, output_dir, split='train')
-    builder.save_dataset(balanced_val, output_dir, split='val')
+    builder.save_dataset(train_samples, output_dir, split='train')
+    builder.save_dataset(val_samples, output_dir, split='val')
     
-    # ========== 保存音频样本用于验证 ==========
+    # ========== 9. 保存元数据统计 ==========
+    stats = {
+        'n_clicks': len(positive_samples),
+        'n_train_samples': len(train_samples),
+        'n_val_samples': len(val_samples),
+        'train_positive': train_pos,
+        'train_negative': train_neg,
+        'val_positive': val_pos,
+        'val_negative': val_neg,
+        'snr_range': snr_range,
+        'balance_ratio': balance_ratio,
+        'noise_split_used': split,
+        'strategy_counts': strategy_counts,
+        'noise_pool_size': len(df_split),
+        'noise_pool_used': len(used_idx),
+        'noise_sources': list(map(int, parent_ids))
+    }
+    
+    import json
+    with open(output_dir / 'dataset_stats.json', 'w') as f:
+        json.dump(stats, f, indent=2)
+    
+    logger.info(f"  统计信息已保存: {output_dir / 'dataset_stats.json'}")
+    
+    # ========== 10. 可选：保存调试音频 ==========
     if args.save_wav:
         debug_dir = output_dir / 'debug_wavs'
-        debug_dir.mkdir(parents=True, exist_ok=True)
+        debug_dir.mkdir(exist_ok=True)
         
-        # 保存训练集Click Train样本
-        if train_samples:
-            num_examples = min(10, len(train_samples))
-            for i, sample in enumerate(random.sample(train_samples, num_examples)):
-                sample_path = debug_dir / f'train_click_train_{i:02d}.wav'
-                sf.write(str(sample_path), sample['waveform'], sample_rate)
-            logger.info(f"已保存 {num_examples} 个训练集Click Train样本")
+        logger.info(f"\n保存调试音频到: {debug_dir}")
         
-        # 保存验证集Click Train样本
-        if val_positive_samples:
-            num_examples = min(5, len(val_positive_samples))
-            for i, sample in enumerate(random.sample(val_positive_samples, num_examples)):
-                sample_path = debug_dir / f'val_click_train_{i:02d}.wav'
-                sf.write(str(sample_path), sample['waveform'], sample_rate)
-            logger.info(f"已保存 {num_examples} 个验证集Click Train样本")
+        # 训练集样本
+        num_train_examples = min(10, len(train_samples))
+        for i, sample in enumerate(random.sample(train_samples, num_train_examples)):
+            label_str = 'click' if sample['label'] == 1 else 'noise'
+            
+            # 添加策略信息到文件名
+            if 'strategy' in sample:
+                filename = f"train_{label_str}_{sample['strategy']}_{i:02d}.wav"
+            else:
+                filename = f"train_{label_str}_{i:02d}.wav"
+            
+            sf.write(debug_dir / filename, sample['waveform'], sample_rate)
         
-        # 保存负样本示例
-        if train_negative_samples:
-            num_examples = min(10, len(train_negative_samples))
-            for i, sample in enumerate(random.sample(train_negative_samples, num_examples)):
-                sample_path = debug_dir / f'train_noise_{i:02d}.wav'
-                sf.write(str(sample_path), sample['waveform'], sample_rate)
-            logger.info(f"已保存 {num_examples} 个训练集噪声样本")
+        logger.info(f"  训练集: {num_train_examples} 个样本")
         
-        logger.info(f"调试音频样本保存到: {debug_dir}")
+        # 验证集样本
+        num_val_examples = min(5, len(val_samples))
+        for i, sample in enumerate(random.sample(val_samples, num_val_examples)):
+            label_str = 'click' if sample['label'] == 1 else 'noise'
+            filename = f"val_{label_str}_{i:02d}.wav"
+            sf.write(debug_dir / filename, sample['waveform'], sample_rate)
+        
+        logger.info(f"  验证集: {num_val_examples} 个样本")
     
-    # ========== 总结 ==========
+    # ========== 11. 总结 ==========
     logger.info("\n" + "=" * 60)
     logger.info("✅ 数据集构建完成")
     logger.info("=" * 60)
-    logger.info(f"数据集保存到: {output_dir}")
-    logger.info(f"训练集Click Train: {len(train_samples)}")
-    logger.info(f"验证集Click Train: {len(val_positive_samples)}")
-    logger.info(f"SNR混合: 所有train均叠加持续背景噪音")
-    logger.info(f"训练/验证最终数量: {len(balanced_train)}/{len(balanced_val)}")
+    logger.info(f"输出路径: {output_dir}")
+    logger.info(f"训练集: {len(train_samples)} 样本 (正:{train_pos}, 负:{train_neg})")
+    logger.info(f"验证集: {len(val_samples)} 样本 (正:{val_pos}, 负:{val_neg})")
+    logger.info(f"噪音策略: 70%同源 + 30%跨域")
+    logger.info(f"噪音来源: {sorted(parent_ids)}")
+    logger.info(f"SNR范围: [{snr_min}, {snr_max}] dB")
     if args.save_wav:
-        logger.info(f"调试音频样本: {debug_dir}")
+        logger.info(f"调试音频: {debug_dir}")
     logger.info("=" * 60)
 
 def cmd_train(args):

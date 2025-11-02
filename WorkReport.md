@@ -1,0 +1,76 @@
+# 步骤1.1: 组织原始数据（分离训练/测试集）
+python prepare_data.py \
+  --raw_dir data/raw \
+  --output_dir data \
+  --verbose
+
+# 步骤2.1: 统一处理训练数据 (WAV + MAT)
+python preprocessing/resample_and_filter.py \
+  --input data/raw/training_sources \
+  --output data/training_resampled \
+  --sr_target 44100 \
+  --hp_cutoff 1000 \
+  --verbose
+
+# 步骤2.2: 处理测试数据
+python preprocessing/resample_and_filter.py \
+  --input data/test_raw \
+  --output data/test_resampled \
+  --verbose
+
+# 步骤2.3: 处理噪音数据
+python preprocessing/resample_and_filter.py \
+  --input data/raw/noise \
+  --output data/noise_resampled \
+  --verbose
+
+# 步骤3: 划分噪音片段
+python scripts/split_noise_manifest.py \
+  --input-dir data/noise_resampled \
+  --output manifests/noise_manifest.csv
+
+Found 10000 noise files
+
+✅ Generated manifest: manifests/noise_manifest.csv
+Total half-segments: 20000 (10000 × 1s files)
+
+Split distribution:
+  test: 4000 half-segments (2000 1s files)
+  train: 12000 half-segments (6000 1s files)
+  val: 4000 half-segments (2000 1s files)
+
+# 步骤4.1：检测并提取click片段(500ms)
+python main.py batch-detect \
+  --input-dir data/training_resampled \
+  --output-dir data/detection_results \
+  --config configs/detection_enhanced.yaml \
+  --save-audio \
+  --segment-ms 500 \
+  --recursive \
+  --verbose
+
+
+##### 到这一步了，但是用audacity看波形图，发现应该有误判。明天计划是检查rule based detector的规则、逻辑，减少一些误判再进行之后的步骤
+
+
+# 步骤4.2: 收集click片段
+python scripts/collect_clicks.py \
+  --input data/detection_results/audio \
+  --output data/training_clicks \
+  --verbose
+
+# ========== 步骤5: 构建训练数据集(简化版) ==========
+python main.py build-dataset \
+  --events-dir data/training_clicks \
+  --noise-dir data/noise_segments \
+  --output-dir data/training_dataset \
+  --config configs/training.yaml \
+  --save-wav \
+  --verbose
+
+# ========== 步骤6: 训练模型 ==========
+python main.py train \
+  --dataset-dir data/training_dataset \
+  --output-dir models/checkpoints \
+  --config configs/training.yaml \
+  --verbose
