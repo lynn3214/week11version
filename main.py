@@ -113,8 +113,20 @@ def setup_argparse():
                                           help='Build training dataset with SNR mixing')
     dataset_parser.add_argument('--events-dir', type=str, required=True,
                                help='Directory containing click wav files (augmented_clicks)')
-    dataset_parser.add_argument('--noise-dir', type=str, required=True,
-                               help='Directory containing noise segments (noise_train_segs)')
+    dataset_parser.add_argument(
+        '--noise-dir', 
+        type=str, 
+        required=False,  # ← 改为可选
+        default=None,
+        help='Directory containing noise segments (optional if --noise-manifest provided)'
+    )
+    dataset_parser.add_argument(
+        '--noise-manifest', 
+        type=str, 
+        required=False,  # ← 保持可选
+        default=None,
+        help='Noise manifest CSV path (alternative to --noise-dir)'
+    )
     dataset_parser.add_argument('--output-dir', type=str, required=True,
                                help='Output dataset directory')
     dataset_parser.add_argument('--config', type=str, default='configs/training.yaml',
@@ -122,8 +134,6 @@ def setup_argparse():
     dataset_parser.add_argument('--save-wav', action='store_true',
                                help='Save mixed samples as wav files for inspection')
     dataset_parser.add_argument('--verbose', '-v', action='store_true')
-    dataset_parser.add_argument('--noise-manifest', type=str, required=True,  # NEW
-                           help='Noise manifest CSV path')
     dataset_parser.add_argument('--split', type=str, default='train',  # NEW
                             choices=['train', 'val', 'test'],
                             help='Which split to use (default: train)')
@@ -422,14 +432,10 @@ def cmd_trains(args):
 
 def cmd_build_dataset(args):
     """
-    构建训练数据集 (方案2 - 文件级独立 + 70/30策略)
+    构建训练数据集 (修复版 - 支持两种噪音输入模式)
     
-    工作流程：
-    1. 加载500ms click片段（已包含真实上下文）
-    2. 从noise manifest中按split选取噪音half片段
-    3. 70%同源 + 30%跨域策略叠加click与noise -> 正样本
-    4. 使用相同noise池生成纯噪声负样本（不与正样本重复片段）
-    5. 平衡并保存训练集/验证集
+    模式1: 使用 --noise-manifest (推荐)
+    模式2: 使用 --noise-dir (直接扫描目录)
     """
     import pandas as pd
     import numpy as np
@@ -443,8 +449,20 @@ def cmd_build_dataset(args):
     config = load_config(args.config)
     
     logger.info("=" * 60)
-    logger.info("构建训练数据集（方案2: 文件级独立 + 70/30策略）")
+    logger.info("构建训练数据集")
     logger.info("=" * 60)
+    
+    # ========== 参数验证 ==========
+    if args.noise_manifest is None and args.noise_dir is None:
+        logger.error("❌ 必须提供 --noise-manifest 或 --noise-dir 之一！")
+        logger.error("使用方法:")
+        logger.error("  方法1: --noise-manifest manifests/noise_manifest.csv --split train")
+        logger.error("  方法2: --noise-dir data/noise_segments")
+        return
+    
+    if args.noise_manifest and args.noise_dir:
+        logger.warning("⚠️  同时提供了 --noise-manifest 和 --noise-dir")
+        logger.warning("    将优先使用 --noise-manifest")
     
     # ========== 初始化目录 ==========
     output_dir = Path(args.output_dir)
@@ -466,7 +484,7 @@ def cmd_build_dataset(args):
     click_files = list(events_dir.rglob('*.wav'))
     
     if not click_files:
-        logger.error(f"未找到click文件: {events_dir}")
+        logger.error(f"❌ 未找到click文件: {events_dir}")
         return
     
     logger.info(f"\n加载click片段...")
@@ -491,7 +509,8 @@ def cmd_build_dataset(args):
             
             # 验证长度
             if len(audio) != expected_samples:
-                logger.debug(f"长度不符: {click_file.name} ({len(audio)} vs {expected_samples})")
+                if args.verbose:
+                    logger.debug(f"长度不符: {click_file.name} ({len(audio)} vs {expected_samples})")
                 skipped_clicks += 1
                 continue
             
@@ -514,34 +533,91 @@ def cmd_build_dataset(args):
         logger.error("❌ 没有有效的click样本！")
         return
     
-    # ========== 2. 加载noise manifest ==========
-    manifest_path = Path(args.noise_manifest)
-    if not manifest_path.exists():
-        logger.error(f"未找到noise manifest: {manifest_path}")
-        return
+    # ========== 2. 加载噪音数据 ==========
+    logger.info(f"\n加载噪音数据...")
     
-    logger.info(f"\n加载noise manifest...")
-    logger.info(f"  Manifest路径: {manifest_path}")
+    # 决定使用哪种模式
+    use_manifest = args.noise_manifest is not None
     
-    df = pd.read_csv(manifest_path)
-    split = args.split.lower()
-    df_split = df[df["split"] == split].reset_index(drop=True)
-    
-    if len(df_split) == 0:
-        logger.error(f"❌ Manifest中没有split='{split}'的数据！")
-        return
-    
-    logger.info(f"  Split: {split}")
-    logger.info(f"  可用half片段: {len(df_split)} 个")
-    
-    # 识别parent_id（噪音源）
-    parent_ids = df_split['parent_id'].unique()
-    logger.info(f"  包含噪音源: {sorted(parent_ids)} (共{len(parent_ids)}个)")
-    
-    # 统计每个parent_id的片段数
-    for pid in sorted(parent_ids):
-        count = len(df_split[df_split['parent_id'] == pid])
-        logger.info(f"    Parent {pid}: {count} half-segments")
+    if use_manifest:
+        # ========== 模式1: 使用 manifest ==========
+        manifest_path = Path(args.noise_manifest)
+        if not manifest_path.exists():
+            logger.error(f"❌ 未找到noise manifest: {manifest_path}")
+            return
+        
+        logger.info(f"  Manifest路径: {manifest_path}")
+        logger.info(f"  使用split: {args.split}")
+        
+        df = pd.read_csv(manifest_path)
+        df_split = df[df["split"] == args.split].reset_index(drop=True)
+        
+        if len(df_split) == 0:
+            logger.error(f"❌ Manifest中没有split='{args.split}'的数据！")
+            logger.info(f"可用的split: {df['split'].unique()}")
+            return
+        
+        logger.info(f"  可用half片段: {len(df_split)} 个")
+        
+        # 识别parent_id（噪音源）
+        parent_ids = df_split['parent_id'].unique()
+        logger.info(f"  包含噪音源: {sorted(parent_ids)} (共{len(parent_ids)}个)")
+        
+        # 统计每个parent_id的片段数
+        for pid in sorted(parent_ids):
+            count = len(df_split[df_split['parent_id'] == pid])
+            logger.info(f"    Parent {pid}: {count} half-segments")
+        
+        has_multiple_sources = len(parent_ids) > 1
+        
+    else:
+        # ========== 模式2: 直接扫描目录 ==========
+        noise_dir = Path(args.noise_dir)
+        if not noise_dir.exists():
+            logger.error(f"❌ 未找到noise目录: {noise_dir}")
+            return
+        
+        logger.info(f"  噪音目录: {noise_dir}")
+        
+        # 扫描所有wav文件
+        noise_files = list(noise_dir.rglob('*.wav'))
+        if not noise_files:
+            logger.error(f"❌ 噪音目录中没有wav文件")
+            return
+        
+        logger.info(f"  找到噪音文件: {len(noise_files)} 个")
+        
+        # 构建简化的DataFrame（兼容后续代码）
+        noise_data = []
+        for idx, nf in enumerate(tqdm(noise_files, desc="扫描噪音文件")):
+            try:
+                audio, sr = sf.read(nf)
+                if sr != sample_rate:
+                    import librosa
+                    audio = librosa.resample(audio, orig_sr=sr, target_sr=sample_rate)
+                if audio.ndim == 2:
+                    audio = audio.mean(axis=1)
+                
+                # 如果文件长度>=expected_samples，可以使用
+                if len(audio) >= expected_samples:
+                    noise_data.append({
+                        'path': str(nf),
+                        'parent_id': 0,  # 统一parent_id
+                        'segment_id': idx,
+                        'start': 0,
+                        'end': len(audio),
+                        'split': 'train',
+                        'audio': audio  # 直接存储音频数据
+                    })
+            except Exception as e:
+                logger.error(f"读取噪音文件失败 {nf}: {e}")
+                continue
+        
+        df_split = pd.DataFrame(noise_data)
+        parent_ids = [0]
+        has_multiple_sources = False
+        
+        logger.info(f"  有效噪音文件: {len(df_split)} 个")
     
     # ========== 3. 预检查容量 ==========
     balance_ratio = dataset_config.get('balance_ratio', 1.0)
@@ -556,7 +632,7 @@ def cmd_build_dataset(args):
     logger.info(f"  可用容量: {len(df_split)} half-segments")
     
     if total_needed > len(df_split):
-        logger.warning(f"⚠️  容量不足！需要 {total_needed}，只有 {len(df_split)}")
+        logger.warning(f"⚠️  容量不足：需要 {total_needed}，只有 {len(df_split)}")
         logger.warning(f"    将允许噪音片段重复使用")
         allow_reuse = True
     else:
@@ -569,15 +645,7 @@ def cmd_build_dataset(args):
     # ========== 4. 定义辅助函数 ==========
     
     def get_noise_half(force_parent_id=None):
-        """
-        随机选一个未使用的噪声half（支持指定parent_id）
-        
-        Args:
-            force_parent_id: 如果指定，只从该parent_id中采样
-            
-        Returns:
-            (noise_segment, row_info)
-        """
+        """随机选一个未使用的噪声half"""
         # 确定采样池
         if force_parent_id is not None:
             df_pool = df_split[df_split['parent_id'] == force_parent_id].reset_index(drop=True)
@@ -600,14 +668,20 @@ def cmd_build_dataset(args):
             row = df_pool.iloc[idx]
             
             # 构造全局索引（用于去重）
-            global_idx = f"{row.parent_id}_{row.original_seg_id}_{row.half}"
+            if use_manifest:
+                global_idx = f"{row.parent_id}_{row.get('original_seg_id', row.segment_id)}_{row.get('half', 0)}"
+            else:
+                global_idx = f"{row.parent_id}_{row.segment_id}"
             
             if allow_reuse or global_idx not in used_idx:
                 used_idx.add(global_idx)
                 
                 # 读取音频
-                y, sr = sf.read(row.path)
-                seg = y[int(row.start):int(row.end)]
+                if use_manifest:
+                    y, sr = sf.read(row.path)
+                    seg = y[int(row.start):int(row.end)]
+                else:
+                    seg = row.audio  # 直接使用缓存的音频
                 
                 # 验证长度
                 if len(seg) == expected_samples:
@@ -617,17 +691,7 @@ def cmd_build_dataset(args):
         raise RuntimeError(f"Failed to get valid noise segment after {max_attempts} attempts")
     
     def mix_with_snr(click, noise, snr_db):
-        """
-        按指定SNR混合click与noise
-        
-        Args:
-            click: Click信号
-            noise: 噪音信号
-            snr_db: 目标SNR (dB)
-            
-        Returns:
-            混合后的信号
-        """
+        """按指定SNR混合click与noise"""
         # 计算RMS功率
         rms_click = np.sqrt(np.mean(click**2))
         rms_noise = np.sqrt(np.mean(noise**2))
@@ -655,15 +719,12 @@ def cmd_build_dataset(args):
     logger.info(f"  策略: 70%同源 + 30%跨域")
     logger.info(f"  SNR范围: [{snr_min}, {snr_max}] dB")
     
-    # 检查是否有多个噪音源（用于跨域）
-    has_multiple_sources = len(parent_ids) > 1
-    
     if not has_multiple_sources:
         logger.warning(f"⚠️  只有1个噪音源，无法实现跨域策略")
         logger.warning(f"    将100%使用同源噪音")
     
     mixed_positive = []
-    strategy_counts = {'same_domain': 0, 'cross_domain': 0, 'fallback': 0}
+    strategy_counts = {'same_domain': 0, 'cross_domain': 0}
     
     for i, sample in enumerate(tqdm(positive_samples, desc="混合click+noise")):
         try:
@@ -797,7 +858,8 @@ def cmd_build_dataset(args):
         'val_negative': val_neg,
         'snr_range': snr_range,
         'balance_ratio': balance_ratio,
-        'noise_split_used': split,
+        'noise_mode': 'manifest' if use_manifest else 'directory',
+        'noise_split_used': args.split if use_manifest else 'N/A',
         'strategy_counts': strategy_counts,
         'noise_pool_size': len(df_split),
         'noise_pool_used': len(used_idx),
@@ -848,8 +910,10 @@ def cmd_build_dataset(args):
     logger.info(f"输出路径: {output_dir}")
     logger.info(f"训练集: {len(train_samples)} 样本 (正:{train_pos}, 负:{train_neg})")
     logger.info(f"验证集: {len(val_samples)} 样本 (正:{val_pos}, 负:{val_neg})")
-    logger.info(f"噪音策略: 70%同源 + 30%跨域")
-    logger.info(f"噪音来源: {sorted(parent_ids)}")
+    logger.info(f"噪音模式: {'Manifest' if use_manifest else 'Directory'}")
+    if use_manifest:
+        logger.info(f"噪音策略: 70%同源 + 30%跨域")
+        logger.info(f"噪音来源: {sorted(parent_ids)}")
     logger.info(f"SNR范围: [{snr_min}, {snr_max}] dB")
     if args.save_wav:
         logger.info(f"调试音频: {debug_dir}")

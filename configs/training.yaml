@@ -1,48 +1,120 @@
-# Training configuration (优化版 - 120ms输入 + Click Train序列)
+# Training configuration (方案A优化版 - 保守策略)
 
 # Sample rate
 sample_rate: 44100
 
 # Model architecture
 model:
-  use_lightweight: true  # 使用轻量级模型
-  input_length: 22050    # 0.5s at 44.1kHz (500ms，统一长度)
+  model_type: optimized      # 'optimized' (推荐), 'lightweight', 'full'
+  input_length: 22050        # 500ms @ 44.1kHz (统一长度)
   num_classes: 2
-  base_channels: 16      # 轻量级: 16 (原版: 32)
-  num_blocks: 3          # 轻量级: 3  (原版: 4)
-  dropout: 0.3
+  base_channels: 8           # 优化版: 8 (原轻量级: 16, 原完整版: 32)
+  dropout: 0.3               # 只用在FC层（保守策略）
 
 # Training parameters
 training:
-  batch_size: 128        # 可以增大batch size (原64 -> 128)
+  batch_size: 128            # 优化后可以增大batch size
   num_epochs: 100
-  learning_rate: 0.001
-  weight_decay: 0.0001
-  early_stopping_patience: 10
+  learning_rate: 0.001       # 初始学习率
+  weight_decay: 0.0001       # L2正则化
+  early_stopping_patience: 15  # 增加耐心值（优化后模型可能收敛较慢）
   
+  # 学习率调度器
+  scheduler:
+    type: reduce_on_plateau  # 'reduce_on_plateau' or 'cosine'
+    factor: 0.5              # 学习率衰减因子
+    patience: 5              # plateau检测耐心值
+    min_lr: 1.0e-6           # 最小学习率
+
 # Data augmentation
 augmentation:
-  snr_range: [-5, 15]  # dB
-  time_shift_ms: 10.0
-  amplitude_range: [0.8, 1.25]
-  apply_prob: 0.8
+  snr_range: [-5, 15]        # SNR范围 (dB)
+  time_shift_ms: 10.0        # 时间偏移范围 (ms)
+  amplitude_range: [0.8, 1.25]  # 幅度缩放范围
+  apply_prob: 0.8            # 应用增强的概率
   
 # Dataset construction
 dataset:
   window_ms: 120.0           # 单click片段长度（120ms）
-  random_offset_ms: 10.0
+  unified_length_ms: 500.0   # 统一所有样本到500ms
+  random_offset_ms: 10.0     # 随机偏移范围
   balance_ratio: 1.0         # negative/positive ratio
-  val_split: 0.2
-
+  val_split: 0.2             # 验证集比例
 
 # Device
-device: cpu  # or 'cuda'
+device: cpu  # 'cpu' or 'cuda'
 
-# 可选：如果想用原版模型（更慢但可能更准确）
+# ========== 实验配置（可选） ==========
+
+# 实验1：对比不同模型
+experiments:
+  compare_models:
+    enabled: false
+    models:
+      - model_type: optimized
+        base_channels: 8
+        name: "Optimized_8ch"
+      - model_type: optimized
+        base_channels: 4
+        name: "Optimized_4ch"
+      - model_type: lightweight
+        base_channels: 16
+        name: "Lightweight_16ch"
+
+# 实验2：对比不同dropout率
+  compare_dropout:
+    enabled: false
+    dropout_rates: [0.2, 0.3, 0.4, 0.5]
+
+# ========== 如果需要使用原版模型，修改如下 ==========
+
+# # Lightweight原版配置
 # model:
-#   use_lightweight: false
-#   input_length: 5292
+#   model_type: lightweight
+#   input_length: 22050
+#   num_classes: 2
+#   base_channels: 16
+#   num_blocks: 3
+#   dropout: 0.3
+
+# # Full原版配置
+# model:
+#   model_type: full
+#   input_length: 22050
 #   num_classes: 2
 #   base_channels: 32
 #   num_blocks: 4
 #   dropout: 0.3
+
+# ========== 训练监控建议 ==========
+
+# 观察以下指标来调整dropout：
+# 1. train_loss vs val_loss差距
+#    - 差距<0.05: dropout可能过强 → 减小到0.2
+#    - 差距>0.2:  过拟合 → 增加到0.4-0.5
+#
+# 2. train_acc vs val_acc差距  
+#    - 差距<5%:   正常
+#    - 差距>15%:  过拟合 → 增加dropout或数据增强
+#
+# 3. 验证集曲线
+#    - val_loss持续下降: OK
+#    - val_loss早期下降后上升: 可能过拟合
+
+# ========== 如果过拟合严重，可以尝试 ==========
+
+# model:
+#   dropout: 0.4  # 增加dropout
+#
+# augmentation:
+#   apply_prob: 0.9  # 增加数据增强概率
+#   snr_range: [-10, 20]  # 扩大SNR范围
+
+# ========== 如果欠拟合（train和val都低），可以尝试 ==========
+
+# model:
+#   base_channels: 16  # 增加通道数
+#   dropout: 0.2       # 减小dropout
+#
+# training:
+#   learning_rate: 0.002  # 增加学习率

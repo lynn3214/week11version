@@ -51,18 +51,54 @@ python main.py batch-detect \
 
 
 ##### 到这一步了，但是用audacity看波形图，发现应该有误判。明天计划是检查rule based detector的规则、逻辑，减少一些误判再进行之后的步骤
+## 新增手动筛选的脚本
+python scripts/manual_click_labeler.py \
+  --input data/detection_results/audio \
+  --output data/manual_labelled \
+  --csv data/detection_results/all_events.csv
 
+## 可以调用分批标注功能
+# 第一批：标注100个左右
+python scripts/manual_click_labeler.py \
+  --input data/detection_results/audio \
+  --output data/manual_labelled \
+  --shuffle
 
+# 差不多了就退出
+
+# 第二批：继续标注（脚本会记住已标注的）
+python scripts/manual_click_labeler.py \
+  --input data/detection_results/audio \
+  --output data/manual_labelled
+
+# 运行完成之后会更新all_events.csv文件，接下来正常进行之后的步骤就可以
+# 输出：
+# data/manual_labelled/
+# ├── Positive_HQ/             ← ✅ 高质量click
+# ├── Negative_Hard/           ← ❌ 明确误判
+# └── Quarantine/              ← ⚠️ 不确定
+#
+# data/detection_results/all_events.csv  ← ✅ 已更新（只保留Positive_HQ）
+
+```
+不再需要这一步了。collect click的功能是将原本data/detection_result/audio目录下面，每个音频文件夹下面的click片段整理到同一个目录中
+以方便后续处理
+顺便检查是否存在命名冲突
+现在由于进行了手动标注，所以高质量样本、直接用于训练集正样本的click片段转移到了data/manual_labelled/Positive_HQ/ 这个目录下
+因此直接build dataset组建训练集和验证集就可以了
 # 步骤4.2: 收集click片段
 python scripts/collect_clicks.py \
   --input data/detection_results/audio \
   --output data/training_clicks \
   --verbose
+```
 
-# ========== 步骤5: 构建训练数据集(简化版) ==========
+
+# ========== 步骤5: 直接使用高质量片段叠加噪音构建训练集 ==========
 python main.py build-dataset \
-  --events-dir data/training_clicks \
-  --noise-dir data/noise_segments \
+  --events-dir data/manual_labelled/Positive_HQ \
+  --noise-manifest manifests/noise_manifest.csv \
+  --split train \
   --output-dir data/training_dataset \
   --config configs/training.yaml \
   --save-wav \
@@ -70,7 +106,12 @@ python main.py build-dataset \
 
 # ========== 步骤6: 训练模型 ==========
 python main.py train \
+    --dataset-dir data/training_dataset \
+    --output-dir checkpoints/v1.1 \
+    --config configs/training.yaml \
+    --verbose
+    
+python main.py train \
   --dataset-dir data/training_dataset \
   --output-dir models/checkpoints \
-  --config configs/training.yaml \
   --verbose
