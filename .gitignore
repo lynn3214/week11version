@@ -1,2 +1,4 @@
 /data
-models/checkpoints
+/models/checkpoints
+/backup_1118_batchdetect_failed
+detection_results.zip

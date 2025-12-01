@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Resampling and high-pass filtering utilities for dolphin click detection.
-统一处理 WAV / MAT / Pickle 三种格式，全部输出为 44.1kHz WAV
+1116修改版: 输出 .npy 格式避免 clipping
+统一处理 WAV / MAT / Pickle 三种格式,全部输出为 44.1kHz NPY
 支持 MATLAB v7.3 (HDF5) 格式
 """
 
@@ -37,7 +38,7 @@ def resample_and_hpf(
         hp_order: Filter order (default 4)
         
     Returns:
-        Filtered and resampled signal as float32
+        Filtered and resampled signal as float32 (保留原始幅度)
     """
     # Handle empty input safely
     if x is None or len(x) == 0:
@@ -57,6 +58,7 @@ def resample_and_hpf(
         sos = butter(hp_order, hp_cutoff, 'highpass', fs=sr_target, output='sos')
         y = sosfilt(sos, y)
     
+    # ✅ 不做归一化,保留原始幅度
     return y.astype(np.float32)
 
 
@@ -101,7 +103,7 @@ def _load_mat_v73_with_h5py(file_path: Path) -> Tuple[np.ndarray, int]:
                 break
         
         if sr is None:
-            logging.warning(f"未找到采样率，假设为 96000 Hz")
+            logging.warning(f"未找到采样率,假设为 96000 Hz")
             sr = 96000
     
     return np.asarray(audio), sr
@@ -188,13 +190,13 @@ def load_audio_file(
                         break
                 
                 if sr is None:
-                    logging.warning(f"未找到采样率，假设为 96000 Hz: {file_path}")
+                    logging.warning(f"未找到采样率,假设为 96000 Hz: {file_path}")
                     sr = 96000
                 
             except NotImplementedError as e:
-                # MATLAB v7.3 格式，使用 h5py
+                # MATLAB v7.3 格式,使用 h5py
                 if "HDF" in str(e) or "v7.3" in str(e):
-                    logging.info(f"检测到 MATLAB v7.3 格式，使用 h5py: {file_path.name}")
+                    logging.info(f"检测到 MATLAB v7.3 格式,使用 h5py: {file_path.name}")
                     audio, sr = _load_mat_v73_with_h5py(file_path)
                 else:
                     raise
@@ -202,12 +204,12 @@ def load_audio_file(
             # 处理数据维度和通道选择
             audio = np.asarray(audio)
             
-            # 如果是2D且行少列多，转置
+            # 如果是2D且行少列多,转置
             if audio.ndim == 2 and audio.shape[0] < audio.shape[1]:
                 audio = audio.T
                 logging.debug(f"转置数据: {audio.shape}")
             
-            # 多通道处理：选择指定通道
+            # 多通道处理:选择指定通道
             if audio.ndim == 2:
                 num_channels = audio.shape[1]
                 # 确保通道索引有效
@@ -233,9 +235,12 @@ def _process_waveform_and_save(
     out_path: Path,
     cfg: dict
 ) -> None:
-    """Process single waveform and save to file."""
-    # 确保输出文件是 .wav 格式
-    out_path = out_path.with_suffix('.wav')
+    """
+    Process single waveform and save to NPY file.
+    ✅ 修改: 输出 .npy 格式而非 .wav
+    """
+    # ✅ 确保输出文件是 .npy 格式
+    out_path = out_path.with_suffix('.npy')
     
     # 重采样和滤波
     y = resample_and_hpf(
@@ -248,8 +253,8 @@ def _process_waveform_and_save(
     # 创建输出目录
     out_path.parent.mkdir(parents=True, exist_ok=True)
     
-    # 保存为WAV文件
-    sf.write(str(out_path), y, cfg['sr_target'])
+    # ✅ 保存为NPY文件 (保留完整精度)
+    np.save(str(out_path), y)
     
     logging.debug(f"已保存: {out_path}")
 
@@ -264,7 +269,7 @@ def process_file(
 ) -> bool:
     """
     Process a single audio file (WAV/MAT/Pickle).
-    Always outputs .wav format at target sample rate.
+    ✅ 修改: 总是输出 .npy 格式
     
     Args:
         input_path: Input file path
@@ -287,19 +292,19 @@ def process_file(
         # 加载音频文件
         audio, sr_orig = load_audio_file(input_path, channel=mat_channel)
         
-        # 处理多维数据（pickle文件可能返回2D数组）
+        # 处理多维数据(pickle文件可能返回2D数组)
         if audio.ndim == 2:
-            # 多行数据：每行保存为独立的WAV文件
+            # 多行数据:每行保存为独立的NPY文件
             for i, row in enumerate(audio):
-                out_file = output_path.with_suffix('').as_posix() + f'_{i:05d}.wav'
+                out_file = output_path.with_suffix('').as_posix() + f'_{i:05d}.npy'
                 _process_waveform_and_save(row, sr_orig, Path(out_file), cfg)
             
             logging.info(f"已处理 {len(audio)} 个片段从: {input_path.name}")
         else:
-            # 单个波形：直接保存
-            output_wav = output_path.with_suffix('.wav')
-            _process_waveform_and_save(audio, sr_orig, output_wav, cfg)
-            logging.info(f"已处理: {input_path.name} -> {output_wav.name}")
+            # 单个波形:直接保存
+            output_npy = output_path.with_suffix('.npy')
+            _process_waveform_and_save(audio, sr_orig, output_npy, cfg)
+            logging.info(f"已处理: {input_path.name} -> {output_npy.name}")
         
         return True
             
@@ -313,7 +318,7 @@ def process_file(
 def main():
     """CLI entry point."""
     parser = argparse.ArgumentParser(
-        description='统一处理音频文件：重采样和滤波 (支持 WAV/MAT/Pickle，全部输出WAV)'
+        description='统一处理音频文件:重采样和滤波 (支持 WAV/MAT/Pickle,全部输出NPY)'
     )
     parser.add_argument(
         '--input', type=str, required=True,
@@ -360,7 +365,7 @@ def main():
     try:
         import h5py
     except ImportError:
-        logging.warning("未安装 h5py，无法处理 MATLAB v7.3 文件")
+        logging.warning("未安装 h5py,无法处理 MATLAB v7.3 文件")
         logging.warning("安装命令: pip install h5py")
     
     # 处理单个文件
@@ -383,7 +388,7 @@ def main():
     # 扫描所有支持的文件
     files = list(input_path.rglob('*'))
     
-    # 文件筛选：WAV/MAT/PKL + noise目录下的无后缀文件
+    # 文件筛选:WAV/MAT/PKL + noise目录下的无后缀文件
     files = [f for f in files if (
         f.is_file() and
         f.name != '.DS_Store' and
@@ -407,6 +412,7 @@ def main():
     logging.info(f"  MAT文件: {len(mat_files)}")
     logging.info(f"  Pickle/Noise文件: {len(pkl_files)}")
     logging.info(f"  总计: {len(files)}")
+    logging.info(f"\n✅ 所有文件将输出为 .npy 格式")
     
     if mat_files:
         logging.info(f"\nMAT文件将使用通道 {args.mat_channel}")
@@ -455,12 +461,13 @@ def main():
     print(f"成功处理: {processed_count} 个文件")
     print(f"处理失败: {failed_count} 个文件")
     print(f"输出目录: {output_path}")
-    print(f"\n所有文件已统一转换为 {args.sr_target} Hz WAV 格式")
+    print(f"\n所有文件已统一转换为 {args.sr_target} Hz NPY 格式")
+    print("使用 export_npy_to_wav.py 可转换为 WAV 供 Audacity 查看")
     
     if failed_count == 0:
-        print("\n✅ 所有文件处理成功！")
+        print("\n✅ 所有文件处理成功!")
     else:
-        print(f"\n⚠️  {failed_count} 个文件处理失败，请检查错误日志")
+        print(f"\n⚠️  {failed_count} 个文件处理失败,请检查错误日志")
 
 
 if __name__ == '__main__':

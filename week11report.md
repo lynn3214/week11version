@@ -252,3 +252,17 @@ It ensures that every training sample originates from **verified click events** 
 
 
 
+去掉dataport数据集
+dolphin clicks下面的数据集先不用，之后想要improve的时候再用
+修改归一化代码，不要使用多种归一化和Max归一化，考虑使用median(abs(x)) normalization
+避免中间结果被保存成wav格式，因为会被clipped，这个可能才是被clipped的原因。中间结果使用npy格式保存
+
+尝试另一种方法，乘1.349左右的数字。这个我没太懂艾q儿这样的发音。高斯假设
+robust因为不用考虑越界值
+1.349
+提取的时候如果click在开头或者结尾的时候，不需要去掉，直接往前或者往后取值，而不是位于中间就可以
+
+
+直接提取一秒左右长度的片段，然后在这个一秒范围内取多个片段，这样就可以实现augmentation，最多一个片段取三个子片段
+提升effective number of samples，因为如果overlap太多的话实际上就是在对非常类似的片段进行训练和识别
+提升ESS

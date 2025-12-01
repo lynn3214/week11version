@@ -1,3 +1,4 @@
+# week13
 # 步骤1.1: 组织原始数据（分离训练/测试集）
 python prepare_data.py \
   --raw_dir data/raw \
@@ -24,10 +25,16 @@ python preprocessing/resample_and_filter.py \
   --output data/noise_resampled \
   --verbose
 
-# 步骤3: 划分噪音片段
-python scripts/split_noise_manifest.py \
+# 步骤3: 噪音集处理（片段划分，数据集组建）
+python scripts/segment_and_split_noise.py \
   --input-dir data/noise_resampled \
-  --output manifests/noise_manifest.csv
+  --output-dir data/noise_segments \
+  --manifest-output manifests/noise_manifest.csv \
+  --train-ratio 0.6 \
+  --val-ratio 0.1 \
+  --test-ratio 0.3 \
+  --seed 42 \
+  --verbose
 
 Found 10000 noise files
 
@@ -46,12 +53,16 @@ python main.py batch-detect \
   --config configs/detection_enhanced.yaml \
   --save-audio \
   --segment-ms 500 \
-  --recursive \
-  --verbose
+  --recursive 
 
+# 步骤4.2：自动筛选分类
+python scripts/auto_filter_uncertain.py \
+  --events-csv data/detection_results/all_events.csv \
+  --audio-dir data/detection_results/audio \
+  --output data/filtered
 
 ##### 到这一步了，但是用audacity看波形图，发现应该有误判。明天计划是检查rule based detector的规则、逻辑，减少一些误判再进行之后的步骤
-## 新增手动筛选的脚本
+## 步骤4.3 手动筛选
 python scripts/manual_click_labeler.py \
   --input data/detection_results/audio \
   --output data/manual_labelled \
@@ -59,6 +70,7 @@ python scripts/manual_click_labeler.py \
 
 ## 可以调用分批标注功能
 # 第一批：标注100个左右
+## 步骤4.3 手动筛选，随时中断，继续的时候脚本会记住已标注的。全部运行完之后会更行all_events.csv文件
 python scripts/manual_click_labeler.py \
   --input data/detection_results/audio \
   --output data/manual_labelled \
@@ -96,12 +108,10 @@ python scripts/collect_clicks.py \
 
 # ========== 步骤5: 直接使用高质量片段叠加噪音构建训练集 ==========
 python main.py build-dataset \
-  --events-dir data/manual_labelled/Positive_HQ \
+  --events-dir detection_results/audio \
   --noise-manifest manifests/noise_manifest.csv \
   --split train \
-  --output-dir data/training_dataset \
-  --config configs/training.yaml \
-  --save-wav \
+  --output-dir dataset \
   --verbose
 
 # ========== 步骤6: 训练模型 ==========

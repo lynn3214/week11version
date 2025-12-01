@@ -28,12 +28,12 @@ envelope:
   db_threshold: -10
 
 # Refractory period
-refractory_ms: 10.0   #从1.5增大到10ms，减少重复检测
+refractory_ms: 1.5   #从1.5增大到10ms，减少重复检测--1116改回1.5ms
 
 # Transient detection (新增)
 transient:
   enable_filter: true
-  min_dolphin_likelihood: 0.5  # 从0.3提高到0.5（50%以上才接受）
+  min_dolphin_likelihood: 0.3  # 从0.3提高到0.5（50%以上才接受）--1116改回0.3，宽容一些
   analysis_window_ms: 20.0
   shrimp_peak_sharpness_threshold: 15.0    # 从20降到15（更容易判定为shrimp）
   shrimp_attack_time_threshold: 0.8        # 从0.5放宽到0.8ms
